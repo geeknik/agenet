@@ -14,6 +14,8 @@ pub struct TopicPolicy {
     pub max_payload_bytes: usize,
     /// Whether PoW can be substituted with credit burn.
     pub allow_credit_substitution: bool,
+    /// Minimum trust graph depth (unique attesters in chain, 0 = no requirement).
+    pub min_trust_depth: u32,
 }
 
 impl Default for TopicPolicy {
@@ -24,6 +26,7 @@ impl Default for TopicPolicy {
             min_reputation_attestations: 0,
             max_payload_bytes: 0,
             allow_credit_substitution: true,
+            min_trust_depth: 0,
         }
     }
 }
@@ -96,12 +99,18 @@ impl PolicyRegistry {
             .map(|mb| (mb as usize) * 1024 * 1024)
             .unwrap_or(0);
 
+        let min_trust_depth = requirements
+            .get("min_trust_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
         self.set(TopicPolicy {
             topic,
             min_pow,
             min_reputation_attestations: min_reputation,
             max_payload_bytes: max_size,
             allow_credit_substitution: true,
+            min_trust_depth,
         });
     }
 
@@ -133,6 +142,7 @@ mod tests {
             min_reputation_attestations: 3,
             max_payload_bytes: 50 * 1024 * 1024,
             allow_credit_substitution: true,
+            min_trust_depth: 0,
         });
         let policy = registry.get("CVE-Research");
         assert_eq!(policy.min_pow, 20);
@@ -166,6 +176,7 @@ mod tests {
             min_reputation_attestations: 1,
             max_payload_bytes: 10 * 1024 * 1024,
             allow_credit_substitution: true,
+            min_trust_depth: 0,
         });
         let policy = registry.get("any-topic");
         assert_eq!(policy.min_pow, 16);

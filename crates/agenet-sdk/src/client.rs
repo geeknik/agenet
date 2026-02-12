@@ -336,6 +336,78 @@ impl AgentClient {
         }
     }
 
+    /// Get the latest compaction snapshot for a topic.
+    pub async fn get_topic_snapshot(&self, topic: &str) -> Result<Value, AgenetError> {
+        let url = format!("{}/topics/{}/snapshot", self.relay_url, topic);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        resp.json::<Value>()
+            .await
+            .map_err(|e| AgenetError::Serialization(e.to_string()))
+    }
+
+    /// Lock a deposit for an agent (enterprise operation).
+    pub async fn lock_deposit(
+        &self,
+        agent_id: &AgentId,
+        amount: i64,
+    ) -> Result<Value, AgenetError> {
+        let url = format!("{}/deposits/lock", self.relay_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "agent_id": agent_id.to_hex(),
+                "amount": amount,
+            }))
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if resp.status().is_success() {
+            resp.json::<Value>()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))
+        } else {
+            Err(AgenetError::Unauthorized("deposit lock failed".into()))
+        }
+    }
+
+    /// Get deposit status for an agent.
+    pub async fn get_deposit(&self, agent_id: &AgentId) -> Result<Value, AgenetError> {
+        let url = format!("{}/deposits/{}", self.relay_url, agent_id.to_hex());
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        resp.json::<Value>()
+            .await
+            .map_err(|e| AgenetError::Serialization(e.to_string()))
+    }
+
+    /// Health check against the relay.
+    pub async fn health_check(&self) -> Result<Value, AgenetError> {
+        let url = format!("{}/health", self.relay_url);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        resp.json::<Value>()
+            .await
+            .map_err(|e| AgenetError::Serialization(e.to_string()))
+    }
+
     /// Access the underlying keypair.
     pub fn keypair(&self) -> &AgentKeypair {
         &self.keypair

@@ -184,6 +184,59 @@ impl AttestationGraph {
             .count() as u32
     }
 
+    /// Count the number of unique attesters for an agent (trust graph depth).
+    /// This measures how many distinct agents have positively attested for this agent,
+    /// both directly and transitively (i.e., attesters of attesters).
+    pub fn unique_attester_depth(&self, agent_id: &AgentId, max_depth: usize) -> u32 {
+        let incoming = self.incoming.read().unwrap();
+        let mut visited = HashSet::new();
+        let mut queue: VecDeque<(AgentId, usize)> = VecDeque::new();
+
+        // Start from the agent's direct attesters
+        if let Some(attestations) = incoming.get(agent_id) {
+            for att in attestations {
+                if matches!(
+                    att.claim,
+                    AttestationClaim::Trustworthy
+                        | AttestationClaim::DomainExpert(_)
+                        | AttestationClaim::ReliableData
+                        | AttestationClaim::GoodActor
+                ) && !visited.contains(&att.attester)
+                {
+                    visited.insert(att.attester.clone());
+                    if max_depth > 1 {
+                        queue.push_back((att.attester.clone(), 1));
+                    }
+                }
+            }
+        }
+
+        // BFS to find transitive attesters
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            if let Some(attestations) = incoming.get(&current) {
+                for att in attestations {
+                    if matches!(
+                        att.claim,
+                        AttestationClaim::Trustworthy
+                            | AttestationClaim::DomainExpert(_)
+                            | AttestationClaim::ReliableData
+                            | AttestationClaim::GoodActor
+                    ) && !visited.contains(&att.attester)
+                        && att.attester != *agent_id
+                    {
+                        visited.insert(att.attester.clone());
+                        queue.push_back((att.attester.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+
+        visited.len() as u32
+    }
+
     /// Find a trust path from `from` to `to` via positive attestations (BFS).
     /// Returns None if no path exists within max_depth.
     pub fn trust_path(
@@ -397,6 +450,46 @@ mod tests {
 
         assert_eq!(graph.negative_attestation_count(&bob.agent_id()), 2);
         assert_eq!(graph.positive_attestation_count(&bob.agent_id()), 1);
+    }
+
+    #[test]
+    fn unique_attester_depth_direct() {
+        let graph = AttestationGraph::new();
+        let alice = AgentKeypair::generate();
+        let bob = AgentKeypair::generate();
+        let carol = AgentKeypair::generate();
+
+        graph.add(Attestation::create(&alice, bob.agent_id(), AttestationClaim::Trustworthy, vec![]));
+        graph.add(Attestation::create(&carol, bob.agent_id(), AttestationClaim::GoodActor, vec![]));
+
+        // Bob has 2 unique attesters (alice and carol)
+        assert_eq!(graph.unique_attester_depth(&bob.agent_id(), 1), 2);
+    }
+
+    #[test]
+    fn unique_attester_depth_transitive() {
+        let graph = AttestationGraph::new();
+        let alice = AgentKeypair::generate();
+        let bob = AgentKeypair::generate();
+        let carol = AgentKeypair::generate();
+        let dave = AgentKeypair::generate();
+
+        // dave -> carol -> bob, alice -> bob
+        graph.add(Attestation::create(&alice, bob.agent_id(), AttestationClaim::Trustworthy, vec![]));
+        graph.add(Attestation::create(&carol, bob.agent_id(), AttestationClaim::Trustworthy, vec![]));
+        graph.add(Attestation::create(&dave, carol.agent_id(), AttestationClaim::Trustworthy, vec![]));
+
+        // At depth 1: alice, carol (2)
+        assert_eq!(graph.unique_attester_depth(&bob.agent_id(), 1), 2);
+        // At depth 2: alice, carol, dave (3)
+        assert_eq!(graph.unique_attester_depth(&bob.agent_id(), 2), 3);
+    }
+
+    #[test]
+    fn unique_attester_depth_no_attesters() {
+        let graph = AttestationGraph::new();
+        let alice = AgentKeypair::generate();
+        assert_eq!(graph.unique_attester_depth(&alice.agent_id(), 3), 0);
     }
 
     #[test]

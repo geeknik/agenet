@@ -14,6 +14,7 @@ use agenet_relay::storage::ObjectStore;
 use agenet_relay::subscription::SubscriptionHub;
 use agenet_types::SchemaId;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Spin up a relay on a random port and return its URL.
@@ -72,7 +73,7 @@ async fn start_relay() -> (String, Arc<RelayState>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
     });
 
     (format!("http://{addr}"), state)
@@ -520,6 +521,7 @@ async fn topic_policy_enforcement() {
         min_reputation_attestations: 0,
         max_payload_bytes: 0,
         allow_credit_substitution: false,
+        min_trust_depth: 0,
     });
 
     // Submit without PoW to restricted topic — should fail
@@ -566,6 +568,7 @@ async fn credit_substitution_for_pow() {
         min_reputation_attestations: 0,
         max_payload_bytes: 0,
         allow_credit_substitution: true,
+        min_trust_depth: 0,
     });
 
     // Mint credits for the agent
@@ -631,6 +634,7 @@ async fn topic_policy_query() {
         min_reputation_attestations: 5,
         max_payload_bytes: 1024 * 1024,
         allow_credit_substitution: true,
+        min_trust_depth: 0,
     });
 
     let resp: serde_json::Value = client
@@ -806,7 +810,7 @@ async fn deposit_endpoints() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
     });
     let url = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -837,4 +841,111 @@ async fn deposit_endpoints() {
     assert_eq!(resp["deposited"], 500);
     assert_eq!(resp["remaining"], 500);
     assert_eq!(resp["status"], "active");
+}
+
+#[tokio::test]
+async fn trust_depth_enforcement() {
+    let (url, state) = start_relay().await;
+    let client = reqwest::Client::new();
+    let agent = AgentKeypair::generate();
+    let attester1 = AgentKeypair::generate();
+    let attester2 = AgentKeypair::generate();
+
+    // Set a policy requiring trust depth >= 2
+    state.policies.set(agenet_relay::policy::TopicPolicy {
+        topic: "trust-gated".into(),
+        min_pow: 0,
+        min_reputation_attestations: 0,
+        max_payload_bytes: 0,
+        allow_credit_substitution: true,
+        min_trust_depth: 2,
+    });
+
+    // Submit without attestations — should fail
+    let object = ObjectBuilder::new(
+        SchemaId::new("Claim", "1.0.0"),
+        json!({"statement": "no trust"}),
+    )
+    .topic("trust-gated")
+    .sign(&agent);
+
+    let resp = client
+        .post(format!("{url}/objects"))
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Add 2 attesters for the agent
+    use agenet_efl::attestation::AttestationClaim;
+    state.attestations.record(attester1.agent_id(), agent.agent_id(), AttestationClaim::Trustworthy);
+    state.attestations.record(attester2.agent_id(), agent.agent_id(), AttestationClaim::GoodActor);
+
+    // Now submit — should succeed (2 unique attesters meets depth >= 2)
+    let resp2 = submit_with_pow(
+        &client,
+        &url,
+        &agent,
+        SchemaId::new("Claim", "1.0.0"),
+        json!({"statement": "trusted agent"}),
+        "trust-gated",
+        vec![],
+    )
+    .await;
+    assert_eq!(resp2.status(), 201);
+}
+
+#[tokio::test]
+async fn reputation_burn_discount() {
+    let (url, state) = start_relay().await;
+    let client = reqwest::Client::new();
+    let agent = AgentKeypair::generate();
+    let attester = AgentKeypair::generate();
+    let agent_hex = agent.agent_id().to_hex();
+
+    // Set policy with PoW + credit substitution
+    state.policies.set(agenet_relay::policy::TopicPolicy {
+        topic: "rep-discount".into(),
+        min_pow: 8,
+        min_reputation_attestations: 0,
+        max_payload_bytes: 0,
+        allow_credit_substitution: true,
+        min_trust_depth: 0,
+    });
+
+    // Mint credits
+    state.credits.mint(&agent.agent_id(), 100, "test").await.unwrap();
+
+    // Add reputation for the agent
+    use agenet_efl::attestation::AttestationClaim;
+    state.attestations.record(attester.agent_id(), agent.agent_id(), AttestationClaim::Trustworthy);
+
+    // Submit without PoW — should burn discounted credits
+    let object = ObjectBuilder::new(
+        SchemaId::new("Claim", "1.0.0"),
+        json!({"statement": "discounted burn"}),
+    )
+    .topic("rep-discount")
+    .sign(&agent);
+
+    let resp = client
+        .post(format!("{url}/objects"))
+        .json(&object)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // With 1 reputation: cost = ceil(1 / (1+1)) = 1 (minimum)
+    // Balance should be 99
+    let resp: serde_json::Value = client
+        .get(format!("{url}/credits/{agent_hex}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["balance"], 99);
 }

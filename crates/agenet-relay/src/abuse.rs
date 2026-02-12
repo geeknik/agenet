@@ -175,6 +175,14 @@ impl BurnEscalation {
         let cost = self.base_cost as f64 * self.abuse_multiplier.powi(abuse_flags as i32);
         (cost as i64).min(self.max_cost)
     }
+
+    /// Calculate burn cost with reputation discount.
+    /// High-reputation agents pay less: cost / (1 + reputation_count).
+    pub fn cost_with_reputation(&self, abuse_flags: u32, reputation_count: u32) -> i64 {
+        let base = self.cost(abuse_flags) as f64;
+        let discounted = base / (1.0 + reputation_count as f64);
+        (discounted.ceil() as i64).max(1)
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +291,19 @@ mod tests {
         assert_eq!(esc.cost(1), 2);
         assert_eq!(esc.cost(2), 4);
         assert_eq!(esc.cost(3), 8);
+    }
+
+    #[test]
+    fn burn_escalation_reputation_discount() {
+        let esc = BurnEscalation::default();
+        // No abuse, no reputation: cost = 1
+        assert_eq!(esc.cost_with_reputation(0, 0), 1);
+        // No abuse, 1 reputation: cost = ceil(1/2) = 1
+        assert_eq!(esc.cost_with_reputation(0, 1), 1);
+        // 2 abuse flags (cost=4), 3 reputation: cost = ceil(4/4) = 1
+        assert_eq!(esc.cost_with_reputation(2, 3), 1);
+        // 3 abuse flags (cost=8), 1 reputation: cost = ceil(8/2) = 4
+        assert_eq!(esc.cost_with_reputation(3, 1), 4);
     }
 
     #[test]

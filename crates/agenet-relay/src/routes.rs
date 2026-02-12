@@ -1,15 +1,16 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use agenet_efl::attestation::AttestationGraph;
 use agenet_efl::credits::{BurnPolicy, CreditLedger};
-use agenet_efl::deposit::DepositEscrow;
+use agenet_efl::deposit::{DepositEscrow, ViolationType};
 use agenet_efl::dynamic_pow::{AgentReputation, DifficultyConfig, TopicRateTracker};
 use agenet_object::{validate_schema, Object};
 use agenet_pow::{self, ChallengeStore};
@@ -47,10 +48,21 @@ pub struct RelayState {
 
 pub async fn post_object(
     State(state): State<Arc<RelayState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(object): Json<Object>,
 ) -> Result<impl IntoResponse, RelayError> {
-    // 0. Rate limit by author
+    // 0. Rate limit by IP
+    let client_ip = addr.ip().to_string();
+    if !state.rate_limiter.check_ip(&client_ip) {
+        return Err(AgenetError::Unauthorized("rate limited (ip)".into()).into());
+    }
+
+    // 0a. Rate limit by author
     if !state.rate_limiter.check_agent(&object.author) {
+        // Record deposit violation for rate-limited agents
+        if let Some(ref deposits) = state.deposits {
+            let _ = deposits.record_violation(&object.author, ViolationType::ProvenSpam).await;
+        }
         return Err(AgenetError::Unauthorized("rate limited".into()).into());
     }
 
@@ -80,6 +92,10 @@ pub async fn post_object(
         .replay_detector
         .check_and_record(&object_hash_hex, object.timestamp)
     {
+        // Record deposit violation for replay attacks
+        if let Some(ref deposits) = state.deposits {
+            let _ = deposits.record_violation(&object.author, ViolationType::ReplayAttack).await;
+        }
         return Err(AgenetError::Duplicate(object_hash_hex).into());
     }
 
@@ -105,9 +121,24 @@ pub async fn post_object(
         if policy.min_reputation_attestations > 0 {
             let attestation_count = state.attestations.positive_attestation_count(&object.author);
             if attestation_count < policy.min_reputation_attestations {
+                if let Some(ref deposits) = state.deposits {
+                    let _ = deposits.record_violation(&object.author, ViolationType::PolicyViolation).await;
+                }
                 return Err(AgenetError::Unauthorized(format!(
                     "topic requires {} attestations, agent has {}",
                     policy.min_reputation_attestations, attestation_count
+                ))
+                .into());
+            }
+        }
+
+        // Check trust graph depth
+        if policy.min_trust_depth > 0 {
+            let depth = state.attestations.unique_attester_depth(&object.author, policy.min_trust_depth as usize);
+            if depth < policy.min_trust_depth {
+                return Err(AgenetError::Unauthorized(format!(
+                    "topic requires trust depth >= {}, agent has {}",
+                    policy.min_trust_depth, depth
                 ))
                 .into());
             }
@@ -127,10 +158,12 @@ pub async fn post_object(
                     .into());
                 }
                 None if policy.allow_credit_substitution => {
-                    // No PoW — burn credits instead (with abuse escalation)
+                    // No PoW — burn credits instead (with abuse escalation + reputation discount)
                     let abuse_flags =
                         state.attestations.negative_attestation_count(&object.author);
-                    let cost = state.burn_escalation.cost(abuse_flags);
+                    let reputation_count =
+                        state.attestations.positive_attestation_count(&object.author);
+                    let cost = state.burn_escalation.cost_with_reputation(abuse_flags, reputation_count);
                     state
                         .credits
                         .burn(&object.author, cost, "post (credit substitution for PoW)")
@@ -157,6 +190,22 @@ pub async fn post_object(
             return Err(AgenetError::InvalidPow.into());
         }
         agenet_pow::verify(pow_proof, &content_hash)?;
+    }
+
+    // 6b. Burn credits for large payloads (artifact cost per DESIGN.md §8.2.1)
+    let payload_bytes = serde_json::to_string(&object.payload)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    if payload_bytes > state.burn_policy.artifact_threshold {
+        let mb_count = ((payload_bytes - state.burn_policy.artifact_threshold) as f64
+            / (1024.0 * 1024.0))
+            .ceil() as i64;
+        let artifact_cost = mb_count.max(1) * state.burn_policy.artifact_per_mb;
+        // Attempt to burn; don't fail if agent has no credits (PoW already paid compute cost)
+        let _ = state
+            .credits
+            .burn(&object.author, artifact_cost, "large artifact storage cost")
+            .await;
     }
 
     // 7. Store (idempotent by content hash)
@@ -392,6 +441,7 @@ pub async fn get_topic_policy(
         "min_reputation_attestations": policy.min_reputation_attestations,
         "max_payload_bytes": policy.max_payload_bytes,
         "allow_credit_substitution": policy.allow_credit_substitution,
+        "min_trust_depth": policy.min_trust_depth,
     }))
 }
 

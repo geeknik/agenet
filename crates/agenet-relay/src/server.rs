@@ -1,5 +1,6 @@
 use axum::routing::{get, post};
 use axum::Router;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -68,7 +69,11 @@ pub async fn run(config: RelayConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     info!("agenet-relay listening on {}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

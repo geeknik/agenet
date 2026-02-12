@@ -175,6 +175,11 @@ impl ObjectBuilder {
         self
     }
 
+    pub fn capabilities(mut self, caps: Vec<String>) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
     pub fn pow_proof(mut self, proof: PowProof) -> Self {
         self.pow_proof = Some(proof);
         self
