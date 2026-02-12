@@ -1,2 +1,26 @@
+# Build artifacts
 /target
+**/target
+
+# SQLite databases
+*.db
 *.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Coverage
+*.profraw
+lcov.info
+tarpaulin-report.html
