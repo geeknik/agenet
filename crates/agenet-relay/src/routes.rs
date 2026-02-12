@@ -11,8 +11,10 @@ use agenet_object::{validate_schema, Object};
 use agenet_pow::{self, ChallengeStore};
 use agenet_types::{AgenetError, ObjectHash};
 
+use crate::abuse::{RateLimiter, ReplayDetector, TtlEnforcer};
 use crate::config::RelayConfig;
 use crate::error::RelayError;
+use crate::merkle::TopicMerkleStore;
 use crate::storage::ObjectStore;
 use crate::subscription::{SubscriptionFilter, SubscriptionHub};
 
@@ -23,6 +25,9 @@ pub struct RelayState {
     pub challenges: ChallengeStore,
     pub hub: SubscriptionHub,
     pub config: RelayConfig,
+    pub merkle: TopicMerkleStore,
+    pub rate_limiter: RateLimiter,
+    pub replay_detector: ReplayDetector,
 }
 
 // --- POST /objects ---
@@ -31,11 +36,15 @@ pub async fn post_object(
     State(state): State<Arc<RelayState>>,
     Json(object): Json<Object>,
 ) -> Result<impl IntoResponse, RelayError> {
+    // 0. Rate limit by author
+    if !state.rate_limiter.check_agent(&object.author) {
+        return Err(AgenetError::Unauthorized("rate limited".into()).into());
+    }
+
     // 1. Validate schema
     validate_schema(&object.schema, &object.payload)?;
 
-    // 2. Verify signature (need public key — for now, trust author field and verify structurally)
-    //    Full verification requires a public key registry; stub for now verifies signature format.
+    // 2. Verify signature format
     if object.signature.is_empty() {
         return Err(AgenetError::InvalidSignature.into());
     }
@@ -45,27 +54,41 @@ pub async fn post_object(
         return Err(AgenetError::InvalidSignature.into());
     }
 
-    // 3. Verify PoW if present
+    // 3. Check TTL
+    if let Err(msg) = TtlEnforcer::check(object.ttl, object.timestamp) {
+        return Err(AgenetError::Unauthorized(msg.to_string()).into());
+    }
+
+    // 4. Replay detection
+    let object_hash_hex = object.hash().to_hex();
+    if !state
+        .replay_detector
+        .check_and_record(&object_hash_hex, object.timestamp)
+    {
+        return Err(AgenetError::Duplicate(object_hash_hex).into());
+    }
+
+    // 5. Verify PoW if present
     if let Some(ref pow_proof) = object.pow_proof {
-        // Hash the object content WITHOUT the pow_proof field to avoid circularity.
-        // The PoW is computed over the object's content, not over itself.
         let mut content_obj = object.raw();
         content_obj.pow_proof = None;
-        let object_hash = content_obj.hash().to_hex();
-        // Consume the challenge (one-use)
+        let content_hash = content_obj.hash().to_hex();
         let challenge = state.challenges.consume(&pow_proof.nonce)?;
-        // Verify difficulty matches
         if pow_proof.difficulty < challenge.difficulty {
             return Err(AgenetError::InvalidPow.into());
         }
-        // Verify the proof
-        agenet_pow::verify(pow_proof, &object_hash)?;
+        agenet_pow::verify(pow_proof, &content_hash)?;
     }
 
-    // 4. Store (idempotent by content hash)
+    // 6. Store (idempotent by content hash)
     let hash = state.store.put(&object).await?;
 
-    // 5. Broadcast to subscribers
+    // 7. Update Merkle tree for the topic
+    if let Some(ref topic) = object.topic {
+        state.merkle.append(topic, hash.0);
+    }
+
+    // 8. Broadcast to subscribers
     state.hub.broadcast(&object);
 
     Ok((
@@ -136,6 +159,39 @@ pub async fn get_topic_log(
     Ok(Json(response))
 }
 
+// --- GET /topics/{topic_id}/merkle-root ---
+
+pub async fn get_merkle_root(
+    State(state): State<Arc<RelayState>>,
+    Path(topic_id): Path<String>,
+) -> impl IntoResponse {
+    match state.merkle.root(&topic_id) {
+        Some(root) => Json(json!({
+            "topic": topic_id,
+            "root": hex::encode(root),
+            "leaves": state.merkle.len(&topic_id),
+        })),
+        None => Json(json!({
+            "topic": topic_id,
+            "root": null,
+            "leaves": 0,
+        })),
+    }
+}
+
+// --- GET /topics/{topic_id}/proof/{index} ---
+
+pub async fn get_merkle_proof(
+    State(state): State<Arc<RelayState>>,
+    Path((topic_id, index)): Path<(String, usize)>,
+) -> Result<impl IntoResponse, RelayError> {
+    state
+        .merkle
+        .proof(&topic_id, index)
+        .map(Json)
+        .ok_or_else(|| AgenetError::NotFound(format!("no proof for index {index} in {topic_id}")).into())
+}
+
 // --- WS /subscribe ---
 
 pub async fn ws_subscribe(
@@ -146,14 +202,15 @@ pub async fn ws_subscribe(
 }
 
 async fn handle_subscription(mut socket: WebSocket, state: Arc<RelayState>) {
-    // Wait for the client to send a filter
     let filter = match socket.recv().await {
         Some(Ok(Message::Text(text))) => match serde_json::from_str::<SubscriptionFilter>(&text) {
             Ok(filter) => filter,
             Err(e) => {
                 let _ = socket
                     .send(Message::Text(
-                        json!({"error": format!("invalid filter: {e}")}).to_string().into(),
+                        json!({"error": format!("invalid filter: {e}")})
+                            .to_string()
+                            .into(),
                     ))
                     .await;
                 return;
@@ -162,12 +219,12 @@ async fn handle_subscription(mut socket: WebSocket, state: Arc<RelayState>) {
         _ => return,
     };
 
-    // Acknowledge the subscription
     let _ = socket
-        .send(Message::Text(json!({"subscribed": true}).to_string().into()))
+        .send(Message::Text(
+            json!({"subscribed": true}).to_string().into(),
+        ))
         .await;
 
-    // Subscribe to the broadcast hub
     let mut receiver = state.hub.subscribe();
 
     loop {
@@ -179,14 +236,16 @@ async fn handle_subscription(mut socket: WebSocket, state: Arc<RelayState>) {
                         Err(_) => continue,
                     };
                     if socket.send(Message::Text(json.into())).await.is_err() {
-                        break; // Client disconnected
+                        break;
                     }
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 let _ = socket
                     .send(Message::Text(
-                        json!({"warning": format!("lagged {n} messages")}).to_string().into(),
+                        json!({"warning": format!("lagged {n} messages")})
+                            .to_string()
+                            .into(),
                     ))
                     .await;
             }

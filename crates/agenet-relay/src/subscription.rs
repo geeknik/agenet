@@ -85,17 +85,6 @@ impl Default for SubscriptionHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn make_filter() -> SubscriptionFilter {
-        SubscriptionFilter {
-            schema: None,
-            tags: vec![],
-            author_trust_set: vec![],
-            ttl_lt: None,
-            topic: None,
-        }
-    }
 
     #[test]
     fn filter_serde_roundtrip() {

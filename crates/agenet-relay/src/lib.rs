@@ -1,5 +1,8 @@
+pub mod abuse;
 pub mod config;
 pub mod error;
+pub mod federation;
+pub mod merkle;
 pub mod routes;
 pub mod server;
 pub mod storage;

@@ -1,7 +1,9 @@
 use agenet_identity::AgentKeypair;
-use agenet_object::{Object, ObjectBuilder, RawObject};
+use agenet_object::{Object, ObjectBuilder};
 use agenet_pow::{self, ChallengeStore};
+use agenet_relay::abuse::{RateLimitConfig, RateLimiter, ReplayDetector};
 use agenet_relay::config::RelayConfig;
+use agenet_relay::merkle::TopicMerkleStore;
 use agenet_relay::routes::RelayState;
 use agenet_relay::server;
 use agenet_relay::storage::ObjectStore;
@@ -22,12 +24,22 @@ async fn start_relay() -> (String, Arc<RelayState>) {
     let store = ObjectStore::open(&config.db_path).await.unwrap();
     let challenges = ChallengeStore::new();
     let hub = SubscriptionHub::default();
+    let merkle = TopicMerkleStore::new();
+    let rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_tokens: 1000, // High burst for tests
+        refill_rate: 100.0,
+        cost: 1,
+    });
+    let replay_detector = ReplayDetector::new(300);
 
     let state = Arc::new(RelayState {
         store,
         challenges,
         hub,
         config: config.clone(),
+        merkle,
+        rate_limiter,
+        replay_detector,
     });
 
     let app = server::router(state.clone());
