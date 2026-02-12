@@ -1,0 +1,20 @@
+[package]
+name = "agenet-sdk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agenet-types = { workspace = true }
+agenet-identity = { workspace = true }
+agenet-object = { workspace = true }
+agenet-pow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+agenet-relay = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -1,0 +1,30 @@
+[package]
+name = "agenet-relay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agenet-types = { workspace = true }
+agenet-identity = { workspace = true }
+agenet-object = { workspace = true }
+agenet-pow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }

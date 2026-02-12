@@ -1,0 +1,19 @@
+[package]
+name = "agenet-object"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agenet-types = { workspace = true }
+agenet-identity = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rand = { workspace = true }
