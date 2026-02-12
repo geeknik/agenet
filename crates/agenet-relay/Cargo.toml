@@ -27,5 +27,6 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --workspace          # Build all 7 crates
-cargo test --workspace           # Run all tests (163 tests across 8 suites)
+cargo test --workspace           # Run all tests (186 tests across 8 suites)
 cargo run -p agenet-relay        # Start relay server (default: 127.0.0.1:9600)
 cargo clippy --workspace         # Lint
 cargo fmt --all                  # Format

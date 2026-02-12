@@ -311,4 +311,70 @@ mod tests {
         assert_eq!(obj.hash(), obj2.hash());
         assert!(obj2.verify_self().is_ok());
     }
+
+    #[test]
+    fn builder_capabilities() {
+        let kp = test_keypair();
+        let obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"statement": "test"}))
+            .capabilities(vec!["read:topic:security".into(), "write:topic:security".into()])
+            .sign(&kp);
+
+        assert_eq!(obj.capabilities.len(), 2);
+        assert_eq!(obj.capabilities[0], "read:topic:security");
+        assert_eq!(obj.capabilities[1], "write:topic:security");
+        assert!(obj.verify_self().is_ok());
+    }
+
+    #[test]
+    fn builder_references() {
+        let kp = test_keypair();
+        let ref_hash = ObjectHash::from_hex(&"ab".repeat(32)).unwrap();
+        let obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"statement": "test"}))
+            .references(vec![ref_hash.clone()])
+            .sign(&kp);
+
+        assert_eq!(obj.references.len(), 1);
+        assert_eq!(obj.references[0], ref_hash);
+        assert!(obj.verify_self().is_ok());
+    }
+
+    #[test]
+    fn builder_ttl() {
+        let kp = test_keypair();
+        let obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"statement": "ephemeral"}))
+            .ttl(3600)
+            .sign(&kp);
+
+        assert_eq!(obj.ttl, Some(3600));
+        assert!(obj.verify_self().is_ok());
+    }
+
+    #[test]
+    fn builder_all_fields() {
+        let kp = test_keypair();
+        let ref_hash = ObjectHash::from_hex(&"cd".repeat(32)).unwrap();
+        let obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"statement": "full"}))
+            .topic("full-test")
+            .ttl(7200)
+            .tags(vec!["tag1".into(), "tag2".into()])
+            .capabilities(vec!["cap1".into()])
+            .references(vec![ref_hash.clone()])
+            .timestamp(1700000000)
+            .sign(&kp);
+
+        assert_eq!(obj.topic, Some("full-test".into()));
+        assert_eq!(obj.ttl, Some(7200));
+        assert_eq!(obj.tags, vec!["tag1", "tag2"]);
+        assert_eq!(obj.capabilities, vec!["cap1"]);
+        assert_eq!(obj.references, vec![ref_hash]);
+        assert_eq!(obj.timestamp, 1700000000);
+        assert!(obj.verify_self().is_ok());
+
+        // Serde roundtrip preserves everything
+        let json = serde_json::to_string(&obj).unwrap();
+        let obj2: Object = serde_json::from_str(&json).unwrap();
+        assert_eq!(obj.hash(), obj2.hash());
+        assert_eq!(obj2.capabilities, obj.capabilities);
+        assert_eq!(obj2.references, obj.references);
+    }
 }
