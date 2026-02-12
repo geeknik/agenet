@@ -104,9 +104,16 @@ impl AgentClient {
         topic: Option<&str>,
     ) -> Result<PowChallenge, AgenetError> {
         let mut url = format!("{}/pow/challenge", self.relay_url);
+        let mut params = Vec::new();
         if let Some(t) = topic {
-            url = format!("{url}?topic={t}");
+            params.push(format!("topic={t}"));
         }
+        // Include agent ID for reputation-based difficulty reduction
+        params.push(format!("agent={}", self.keypair.agent_id().to_hex()));
+        if !params.is_empty() {
+            url = format!("{url}?{}", params.join("&"));
+        }
+
         let resp = self
             .http
             .get(&url)
@@ -132,20 +139,33 @@ impl AgentClient {
         topic: &str,
         tags: Vec<String>,
     ) -> Result<ObjectHash, AgenetError> {
-        // Build the object first to get its hash
+        // Pin timestamp for consistent content hashing
+        let pinned_ts = chrono::Utc::now().timestamp();
+
+        // Build the object to get its content hash
         let object = ObjectBuilder::new(schema.clone(), payload.clone())
             .topic(topic)
             .tags(tags.clone())
+            .timestamp(pinned_ts)
             .sign(&self.keypair);
-        let object_hash = object.hash().to_hex();
+
+        let mut raw = object.raw();
+        raw.pow_proof = None;
+        let object_hash = raw.hash().to_hex();
 
         // Get challenge and solve
         let challenge = self.get_challenge(Some(topic)).await?;
         let proof = self.solve_pow(&challenge, &object_hash);
 
-        // Rebuild with PoW proof
-        self.submit_object(schema, payload, Some(topic), tags, Some(proof))
-            .await
+        // Rebuild with PoW proof and same timestamp
+        let final_object = ObjectBuilder::new(schema, payload)
+            .topic(topic)
+            .tags(tags)
+            .timestamp(pinned_ts)
+            .pow_proof(proof)
+            .sign(&self.keypair);
+
+        self.post_object(&final_object).await
     }
 
     /// Get topic log entries.
@@ -179,6 +199,143 @@ impl AgentClient {
             .map_err(|e| AgenetError::Serialization(e.to_string()))
     }
 
+    /// Mint credits for an agent (admin operation).
+    pub async fn mint_credits(
+        &self,
+        agent_id: &AgentId,
+        amount: i64,
+        reason: &str,
+    ) -> Result<i64, AgenetError> {
+        let url = format!("{}/capabilities/mint", self.relay_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "agent_id": agent_id.to_hex(),
+                "amount": amount,
+                "reason": reason,
+            }))
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))?;
+            Ok(body["balance"].as_i64().unwrap_or(0))
+        } else {
+            Err(AgenetError::Unauthorized("mint failed".into()))
+        }
+    }
+
+    /// Get credit balance for an agent.
+    pub async fn get_balance(&self, agent_id: &AgentId) -> Result<i64, AgenetError> {
+        let url = format!("{}/credits/{}", self.relay_url, agent_id.to_hex());
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))?;
+            Ok(body["balance"].as_i64().unwrap_or(0))
+        } else {
+            Err(AgenetError::NotFound(agent_id.to_hex()))
+        }
+    }
+
+    /// Get Merkle root for a topic.
+    pub async fn get_merkle_root(&self, topic: &str) -> Result<MerkleRootInfo, AgenetError> {
+        let url = format!("{}/topics/{}/merkle-root", self.relay_url, topic);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        resp.json::<MerkleRootInfo>()
+            .await
+            .map_err(|e| AgenetError::Serialization(e.to_string()))
+    }
+
+    /// Get Merkle inclusion proof for an object at a given index.
+    pub async fn get_merkle_proof(
+        &self,
+        topic: &str,
+        index: usize,
+    ) -> Result<Value, AgenetError> {
+        let url = format!("{}/topics/{}/proof/{}", self.relay_url, topic, index);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if resp.status().is_success() {
+            resp.json::<Value>()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))
+        } else {
+            Err(AgenetError::NotFound(format!(
+                "proof for index {index} in {topic}"
+            )))
+        }
+    }
+
+    /// Get topic policy.
+    pub async fn get_topic_policy(&self, topic: &str) -> Result<Value, AgenetError> {
+        let url = format!("{}/topics/{}/policy", self.relay_url, topic);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        resp.json::<Value>()
+            .await
+            .map_err(|e| AgenetError::Serialization(e.to_string()))
+    }
+
+    /// Compact a topic log up to a sequence number.
+    pub async fn compact_topic(
+        &self,
+        topic: &str,
+        up_to_seq: i64,
+    ) -> Result<Value, AgenetError> {
+        let url = format!("{}/topics/{}/compact", self.relay_url, topic);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "up_to_seq": up_to_seq }))
+            .send()
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if resp.status().is_success() {
+            resp.json::<Value>()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))
+        } else {
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| AgenetError::Serialization(e.to_string()))?;
+            Err(AgenetError::Storage(
+                body["detail"].as_str().unwrap_or("compaction failed").to_string(),
+            ))
+        }
+    }
+
     /// Access the underlying keypair.
     pub fn keypair(&self) -> &AgentKeypair {
         &self.keypair
@@ -190,4 +347,12 @@ impl AgentClient {
 pub struct TopicLogEntry {
     pub seq: i64,
     pub object_hash: String,
+}
+
+/// Merkle root information for a topic.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MerkleRootInfo {
+    pub topic: String,
+    pub root: Option<String>,
+    pub leaves: i64,
 }

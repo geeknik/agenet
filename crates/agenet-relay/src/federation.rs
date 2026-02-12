@@ -1,4 +1,4 @@
-use agenet_object::Object;
+use agenet_object::{validate_schema, Object};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -143,12 +143,40 @@ impl FederationManager {
                                     Err(_) => continue,
                                 };
 
-                            for entry in &entries {
+                            let peer_config = {
+                                        let p = peers.read().unwrap();
+                                        p.get(&peer_url).map(|s| s.config.clone())
+                                    };
+
+                                    for entry in &entries {
                                 if let Some(hash) = entry["object_hash"].as_str() {
                                     // Fetch the full object
                                     let obj_url = format!("{}/objects/{}", peer_url, hash);
                                     if let Ok(obj_resp) = client.get(&obj_url).send().await {
                                         if let Ok(object) = obj_resp.json::<Object>().await {
+                                            // Enforce local policy if configured
+                                            if let Some(ref cfg) = peer_config {
+                                                if cfg.apply_local_policy {
+                                                    // Validate schema
+                                                    if validate_schema(&object.schema, &object.payload).is_err() {
+                                                        warn!(peer = %peer_url, hash, "federated object failed schema validation");
+                                                        continue;
+                                                    }
+                                                    // Verify signature
+                                                    if object.verify_self().is_err() {
+                                                        warn!(peer = %peer_url, hash, "federated object failed signature verification");
+                                                        continue;
+                                                    }
+                                                }
+                                                if cfg.enforce_local_efl {
+                                                    // Require PoW proof on federated objects
+                                                    if object.pow_proof.is_none() {
+                                                        warn!(peer = %peer_url, hash, "federated object missing PoW proof");
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+
                                             let federated = FederatedObject {
                                                 object,
                                                 source_peer: peer_url.clone(),

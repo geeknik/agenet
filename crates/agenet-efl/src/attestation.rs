@@ -118,6 +118,20 @@ impl AttestationGraph {
         Self::default()
     }
 
+    /// Record an attestation relationship directly (e.g., from a verified Attestation object).
+    pub fn record(&self, attester: AgentId, attestee: AgentId, claim: AttestationClaim) {
+        let attestation = Attestation {
+            attester: attester.clone(),
+            attester_pubkey: String::new(), // Not needed for graph queries
+            attestee: attestee.clone(),
+            claim,
+            evidence_refs: vec![],
+            timestamp: chrono::Utc::now().timestamp(),
+            signature: String::new(), // Already verified at the object level
+        };
+        self.add(attestation);
+    }
+
     /// Add a verified attestation to the graph.
     pub fn add(&self, attestation: Attestation) {
         self.outgoing

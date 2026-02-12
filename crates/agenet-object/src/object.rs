@@ -25,7 +25,9 @@ pub struct Object {
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow_proof: Option<PowProof>,
-    /// Hex-encoded Ed25519 signature over the canonicalized object (sans signature field).
+    /// Hex-encoded Ed25519 public key of the author (for self-authenticating verification).
+    pub author_pubkey: String,
+    /// Hex-encoded Ed25519 signature over the canonicalized object (sans signature/pubkey fields).
     pub signature: String,
 }
 
@@ -93,6 +95,23 @@ impl Object {
             .verify(canonical.as_bytes(), &signature)
             .map_err(|_| AgenetError::InvalidSignature)
     }
+
+    /// Self-authenticating verification: verify author == SHA-256(author_pubkey) AND signature is valid.
+    pub fn verify_self(&self) -> Result<(), AgenetError> {
+        let pubkey_bytes: [u8; 32] = hex::decode(&self.author_pubkey)
+            .map_err(|_| AgenetError::InvalidSignature)?
+            .try_into()
+            .map_err(|_| AgenetError::InvalidSignature)?;
+
+        // Verify author matches public key
+        let expected_author = AgentId::from_public_key(&pubkey_bytes);
+        if expected_author != self.author {
+            return Err(AgenetError::InvalidSignature);
+        }
+
+        // Verify cryptographic signature
+        self.verify(&pubkey_bytes)
+    }
 }
 
 impl RawObject {
@@ -118,6 +137,7 @@ pub struct ObjectBuilder {
     capabilities: Vec<String>,
     tags: Vec<String>,
     pow_proof: Option<PowProof>,
+    timestamp: Option<Timestamp>,
 }
 
 impl ObjectBuilder {
@@ -131,6 +151,7 @@ impl ObjectBuilder {
             capabilities: Vec::new(),
             tags: Vec::new(),
             pow_proof: None,
+            timestamp: None,
         }
     }
 
@@ -159,9 +180,16 @@ impl ObjectBuilder {
         self
     }
 
+    pub fn timestamp(mut self, ts: Timestamp) -> Self {
+        self.timestamp = Some(ts);
+        self
+    }
+
     /// Sign and produce the final Object.
     pub fn sign(self, keypair: &AgentKeypair) -> Object {
-        let now = chrono::Utc::now().timestamp();
+        let now = self
+            .timestamp
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
         let raw = RawObject {
             schema: self.schema,
             author: keypair.agent_id(),
@@ -190,6 +218,7 @@ impl ObjectBuilder {
             capabilities: raw.capabilities,
             tags: raw.tags,
             pow_proof: raw.pow_proof,
+            author_pubkey: hex::encode(keypair.public_key_bytes()),
             signature: sig_hex,
         }
     }
@@ -216,6 +245,7 @@ mod tests {
         .sign(&kp);
 
         assert!(obj.verify(&kp.public_key_bytes()).is_ok());
+        assert!(obj.verify_self().is_ok());
     }
 
     #[test]
@@ -230,6 +260,7 @@ mod tests {
         // Tamper with payload
         obj.payload = json!({"statement": "tampered"});
         assert!(obj.verify(&kp.public_key_bytes()).is_err());
+        assert!(obj.verify_self().is_err());
     }
 
     #[test]
@@ -239,6 +270,17 @@ mod tests {
         let obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"x": 1})).sign(&kp1);
 
         assert!(obj.verify(&kp2.public_key_bytes()).is_err());
+    }
+
+    #[test]
+    fn verify_self_rejects_mismatched_pubkey() {
+        let kp1 = test_keypair();
+        let kp2 = test_keypair();
+        let mut obj = ObjectBuilder::new(SchemaId::new("Claim", "1.0.0"), json!({"x": 1})).sign(&kp1);
+
+        // Replace pubkey with different key — author won't match
+        obj.author_pubkey = hex::encode(kp2.public_key_bytes());
+        assert!(obj.verify_self().is_err());
     }
 
     #[test]
@@ -262,6 +304,6 @@ mod tests {
         let json = serde_json::to_string(&obj).unwrap();
         let obj2: Object = serde_json::from_str(&json).unwrap();
         assert_eq!(obj.hash(), obj2.hash());
-        assert!(obj2.verify(&kp.public_key_bytes()).is_ok());
+        assert!(obj2.verify_self().is_ok());
     }
 }

@@ -1,5 +1,6 @@
 use agenet_object::Object;
 use agenet_types::{AgenetError, ObjectHash};
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::sync::Arc;
 
@@ -72,6 +73,38 @@ impl ObjectStore {
             .await
             .map_err(|e| AgenetError::Storage(e.to_string()))?;
 
+        // Tag index table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS object_tags (
+                object_hash TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (object_hash, tag)
+            )",
+        )
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_object_tags_tag ON object_tags(tag)")
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        // Compaction snapshots
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS compaction_snapshots (
+                topic TEXT NOT NULL,
+                snapshot_seq INTEGER NOT NULL,
+                merkle_root TEXT NOT NULL,
+                object_count INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (topic, snapshot_seq)
+            )",
+        )
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
         Ok(())
     }
 
@@ -99,6 +132,16 @@ impl ObjectStore {
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        // Index tags
+        for tag in &object.tags {
+            sqlx::query("INSERT OR IGNORE INTO object_tags (object_hash, tag) VALUES (?, ?)")
+                .bind(&hash_hex)
+                .bind(tag)
+                .execute(self.pool.as_ref())
+                .await
+                .map_err(|e| AgenetError::Storage(e.to_string()))?;
+        }
 
         // Append to topic log if topic is set
         if let Some(ref topic_id) = object.topic {
@@ -140,6 +183,101 @@ impl ObjectStore {
         }
     }
 
+    /// Query object hashes by tag.
+    pub async fn by_tag(&self, tag: &str, limit: i64) -> Result<Vec<String>, AgenetError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT object_hash FROM object_tags WHERE tag = ? LIMIT ?",
+        )
+        .bind(tag)
+        .bind(limit)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(|(h,)| h).collect())
+    }
+
+    /// Compact a topic log: record a snapshot and prune old entries.
+    ///
+    /// Keeps entries after `up_to_seq`, deletes older ones, and records a snapshot
+    /// with the Merkle root at that point. Returns the number of pruned entries.
+    pub async fn compact_topic(
+        &self,
+        topic: &str,
+        up_to_seq: i64,
+        merkle_root: &str,
+    ) -> Result<CompactionResult, AgenetError> {
+        // Count entries that will be compacted
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM topic_log WHERE topic = ? AND seq <= ?",
+        )
+        .bind(topic)
+        .bind(up_to_seq)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        if count == 0 {
+            return Ok(CompactionResult {
+                pruned_entries: 0,
+                snapshot_seq: up_to_seq,
+            });
+        }
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Record snapshot
+        sqlx::query(
+            "INSERT OR REPLACE INTO compaction_snapshots (topic, snapshot_seq, merkle_root, object_count, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(topic)
+        .bind(up_to_seq)
+        .bind(merkle_root)
+        .bind(count)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        // Delete compacted log entries
+        sqlx::query("DELETE FROM topic_log WHERE topic = ? AND seq <= ?")
+            .bind(topic)
+            .bind(up_to_seq)
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        Ok(CompactionResult {
+            pruned_entries: count,
+            snapshot_seq: up_to_seq,
+        })
+    }
+
+    /// Get the latest compaction snapshot for a topic.
+    pub async fn latest_snapshot(
+        &self,
+        topic: &str,
+    ) -> Result<Option<CompactionSnapshot>, AgenetError> {
+        let row: Option<(String, i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT topic, snapshot_seq, merkle_root, object_count, created_at
+             FROM compaction_snapshots WHERE topic = ? ORDER BY snapshot_seq DESC LIMIT 1",
+        )
+        .bind(topic)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| AgenetError::Storage(e.to_string()))?;
+
+        Ok(row.map(
+            |(topic, snapshot_seq, merkle_root, object_count, created_at)| CompactionSnapshot {
+                topic,
+                snapshot_seq,
+                merkle_root,
+                object_count,
+                created_at,
+            },
+        ))
+    }
+
     /// List object hashes in a topic log, paginated by cursor (sequence number).
     pub async fn topic_log(
         &self,
@@ -159,4 +297,21 @@ impl ObjectStore {
 
         Ok(rows)
     }
+}
+
+/// Result of a compaction operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactionResult {
+    pub pruned_entries: i64,
+    pub snapshot_seq: i64,
+}
+
+/// A recorded compaction snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactionSnapshot {
+    pub topic: String,
+    pub snapshot_seq: i64,
+    pub merkle_root: String,
+    pub object_count: i64,
+    pub created_at: i64,
 }

@@ -8,6 +8,7 @@ agenet-types = { workspace = true }
 agenet-identity = { workspace = true }
 agenet-object = { workspace = true }
 agenet-pow = { workspace = true }
+agenet-efl = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
